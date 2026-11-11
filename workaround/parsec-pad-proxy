@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""
+Workaround for Parsec (Linux) not seeing gamepads that exist before it starts.
+
+libmatoya's MTY_AppCreate() enumerates evdev devices and fires
+MTY_EVENT_CONNECT synchronously, before Parsec's app is ready, so the event
+is lost. When Parsec is launched from Steam, Steam's virtual X-Box 360 pad
+(28de:11ff) is always created *before* parsecd starts -> "No controllers
+detected".
+
+This proxy:
+  * waits for the Steam virtual pad, grabs it exclusively (so Parsec's own
+    stale fd gets nothing and there is no double input),
+  * exposes a mirror uinput pad that is created AFTER Parsec has started,
+    so Parsec receives a normal hotplug event,
+  * keeps the mirror alive while the real pad comes and goes (controller
+    sleep / reconnect), so Parsec never loses it.
+
+Usage: parsec-pad-proxy   (normally started by parsec-steam-launch; runs until killed)
+Requires python-evdev and write access to /dev/uinput.
+"""
+import os
+import select
+import signal
+import sys
+import time
+
+import evdev
+from evdev import ecodes, UInput
+
+SRC_VID, SRC_PID = 0x28DE, 0x11FF   # Steam Virtual Gamepad
+PROXY_NAME = "Parsec Steam Pad Proxy"
+
+
+def log(*a):
+    print("[parsec-pad-proxy]", *a, file=sys.stderr, flush=True)
+
+
+def find_source():
+    for path in evdev.list_devices():
+        try:
+            d = evdev.InputDevice(path)
+        except OSError:
+            continue
+        if (d.info.vendor, d.info.product) == (SRC_VID, SRC_PID) and d.name != PROXY_NAME:
+            return d
+        d.close()
+    return None
+
+
+def make_proxy(src):
+    caps = src.capabilities(absinfo=True)
+    caps.pop(ecodes.EV_SYN, None)
+    caps.pop(ecodes.EV_FF, None)  # rumble not forwarded
+    # Same VID/PID as the source so existing gpmap.txt entries apply.
+    return UInput(caps, name=PROXY_NAME, vendor=SRC_VID, product=SRC_PID,
+                  version=src.info.version, bustype=src.info.bustype)
+
+
+def main():
+    stop = False
+
+    def on_sig(*_):
+        nonlocal stop
+        stop = True
+    signal.signal(signal.SIGTERM, on_sig)
+    signal.signal(signal.SIGINT, on_sig)
+
+    ui = None
+    while not stop:
+        src = find_source()
+        if src is None:
+            time.sleep(1)
+            continue
+        try:
+            src.grab()
+        except OSError as e:
+            log("grab failed:", e)
+            src.close()
+            time.sleep(1)
+            continue
+        if ui is None:
+            ui = make_proxy(src)
+            log(f"mirroring {src.path} ({src.name}) -> {ui.device.path}")
+        else:
+            log(f"source reattached: {src.path}")
+        try:
+            while not stop:
+                r, _, _ = select.select([src.fd], [], [], 0.5)
+                if not r:
+                    continue
+                for ev in src.read():
+                    if ev.type == ecodes.EV_FF:
+                        continue
+                    ui.write(ev.type, ev.code, ev.value)
+        except OSError:
+            log("source pad went away, waiting for it to come back")
+            # release all buttons / centre axes so nothing gets stuck
+            for code in ui.capabilities().get(ecodes.EV_KEY, []):
+                ui.write(ecodes.EV_KEY, code, 0)
+            ui.syn()
+        finally:
+            try:
+                src.close()
+            except OSError:
+                pass
+    if ui:
+        ui.close()
+
+
+if __name__ == "__main__":
+    main()

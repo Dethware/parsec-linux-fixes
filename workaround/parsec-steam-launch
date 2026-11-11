@@ -1,0 +1,49 @@
+#!/bin/bash
+# Steam launch wrapper for the Parsec Linux client.
+#
+# Set the Parsec (non-Steam game) shortcut's Launch Options to:
+#   <PREFIX>/bin/parsec-steam-launch %command%
+#
+# - Preloads evdev_coalesce.so into Parsec (fixes stuck buttons with
+#   high-rate pads, and hides Steam's own virtual pad from Parsec).
+# - Starts parsec-pad-proxy a few seconds after Parsec is up, so the pad
+#   arrives as a hotplug event (Parsec ignores pads present at startup).
+
+bindir=$(dirname "$(readlink -f "$0")")
+prefix=$(dirname "$bindir")
+shim="$prefix/lib/parsec-evdev-fix/evdev_coalesce.so"
+proxy="$bindir/parsec-pad-proxy"
+
+if [ -f "$shim" ]; then
+    LD_PRELOAD="$shim${LD_PRELOAD:+:$LD_PRELOAD}" "$@" &
+else
+    echo "[parsec-steam-launch] $shim not found, running without it" >&2
+    "$@" &
+fi
+parsec_pid=$!
+
+# "$@" is Steam's launch-wrapper/reaper chain, not parsecd itself.
+# Wait (max 30 s) until a parsecd process has loaded its app library
+# (~/.parsec/parsecd-*.so).
+for _ in $(seq 1 60); do
+    kill -0 "$parsec_pid" 2>/dev/null || exit 0
+    p=$(pgrep -n -x parsecd)
+    if [ -n "$p" ] && grep -q '/\.parsec/parsecd-.*\.so' /proc/"$p"/maps 2>/dev/null; then
+        break
+    fi
+    sleep 0.5
+done
+sleep 3   # let Parsec finish starting up
+
+lock="${XDG_RUNTIME_DIR:-/tmp}/parsec-pad-proxy.lock"
+(
+    # only one proxy at a time
+    flock -n 9 || exit 0
+    exec "$proxy"   # keeps fd 9 => holds lock
+) 9>"$lock" &
+proxy_pid=$!
+
+wait "$parsec_pid"
+status=$?
+kill "$proxy_pid" 2>/dev/null
+exit $status
