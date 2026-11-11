@@ -36,3 +36,7 @@ Limitation: rumble isn't forwarded.
 | `workaround/` | launcher, pad proxy, preload shim, Makefile |
 | `upstream/libmatoya-evdev-drain.patch` | upstream fix for bug 2 |
 | `tools/matoya_sim.py` | simulation of libmatoya's input loop, with and without the fix |
+
+## License
+
+MIT, see [LICENSE](LICENSE). `upstream/libmatoya-evdev-drain.patch` modifies libmatoya, which is also MIT-licensed.
