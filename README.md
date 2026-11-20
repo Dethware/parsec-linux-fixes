@@ -1,9 +1,11 @@
-# Parsec Linux client: Steam Controller fixes
+# Parsec Linux client: bug reports and Steam Controller fixes
 
-Two bugs in the Parsec Linux client (tested on `150-105c`) make the Steam Controller unusable through Steam Input:
+Bugs in the Parsec Linux client (tested on `150-105c`). The first two make the Steam Controller unusable through Steam Input:
 
 1. **Controller not detected.** Gamepads that already exist when Parsec starts are opened but never registered. Steam always creates its virtual pad before it starts Parsec, so launching Parsec from Steam gives "No controllers detected". Pads plugged in later work.
 2. **Stuck buttons.** libmatoya reads only one input event per gamepad per frame. The Steam Controller's trackpads and gyro send events much faster than that, so the kernel queue overflows and button releases are lost. Upstream: [libmatoya#145](https://github.com/snowcone-ltd/libmatoya/issues/145), fixes in [#146](https://github.com/snowcone-ltd/libmatoya/pull/146) and [#152](https://github.com/snowcone-ltd/libmatoya/pull/152).
+
+3. **Frozen sessions.** When the host's NAT re-maps its UDP port mid-session, the client keeps sending to the old port and ignores the host's packets from the new one. The picture freezes, and `-12007` is logged minutes later.
 
 The analysis, evidence and suggested fixes are in **[REPORT.md](REPORT.md)**.
 

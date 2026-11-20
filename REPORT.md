@@ -1,4 +1,4 @@
-# Parsec Linux client: gamepad bug reports
+# Parsec Linux client: bug reports
 
 **Environment:** Parsec Linux client `release1 150-105c` (self-updated from the `parsec-bin 150-104a` package), Arch-based distro, kernel 7.3. Steam (Linux) with the new **Steam Controller** (wireless puck `28de:1304`), exposed to applications through **Steam Input's virtual X-Box 360 pad** (`28de:11ff`, "Microsoft X-Box 360 pad 0"). Parsec is launched from Steam as a non-Steam shortcut. Host: Windows work machine.
 
@@ -72,4 +72,30 @@ SDL3 already supports these controllers directly through HIDAPI, under the MIT-c
 
 Parsec (or libmatoya's HID layer, which already has drivers for other pads) could use the same approach and support Steam controllers directly, without needing Steam to run.
 
-*A separate report on intermittent `-12007` disconnects, and on the `MTY_AESGCMDecrypt` error flood after a fast reconnect, will follow once we have packet captures.*
+---
+
+## Bug 3: session freezes when the host's NAT re-maps its UDP port
+
+**Symptom:** about half of the connections freeze shortly after connecting. The client logs `Client disconnected with status code: -12007` only minutes later. A session that survives the first few minutes usually stays stable all day.
+
+**Setup:** both ends are behind NAT. The host is behind a corporate firewall; the client is behind a home router. The log shows a direct connection (`net = BUD|<host public IP>|<port>`, `BUD AES_GCM = 256`).
+
+**Packet capture of a frozen session** (client side, UDP only; times are seconds after the connection started):
+
+| t | what happens |
+|---|---|
+| 0 s | P2P flow established: client `:30297` ↔ host `<host IP>:12092`, ~300–700 packets/s each way |
+| 42.7 s | host packets suddenly arrive from **`<host IP>:30666`** instead of `:12092`. The stream is otherwise unchanged: same ~30 ms cadence of 112-byte packets, same header counter (`…0041`) continuing across the switch. So the host is still using the same socket; the host-side NAT gave the flow a new external port. |
+| 42.7 s → | the client keeps sending **only to `:12092`**, which no longer reaches the host, and never switches to `:30666`. The picture freezes. |
+| 102 s | the host stops sending, about 60 s after the switch (its own timeout: it stopped receiving the client's packets). Two packets also arrive from a third port (`:54138`); the client ignores them too. |
+| 160 s+ | the client is still sending to `:12092` at ~130–230 packets/s and hasn't timed out yet. It eventually reports `-12007`. |
+
+The other freeze that night (just before the capture started) ended after 43 s as well, so the re-mapping seems to happen at a fixed point after the session starts. Sessions where it doesn't happen stay up all day.
+
+**Cause:** the client pins the peer's address and port for the whole session. When a NAT re-maps the peer ("NAT rebinding"), the client drops the peer's packets even though they authenticate correctly with the session key.
+
+**Suggested fix (client):** accept authenticated packets from a new source address/port and switch the send address to it (address roaming, as in WireGuard or QUIC connection migration). The packets are AES-GCM authenticated, so following a new address after a successful decrypt is safe.
+
+**Workaround on the host side:** give the host a stable public UDP mapping, e.g. a static port forward on the host's firewall to the host's Parsec ports (`host_start_port`), or a NAT policy that keeps the same external port for the lifetime of the flow.
+
+**Related:** after a disconnect followed by a reconnect within about a second, the client log fills with thousands of `MTY_AESGCMDecrypt: 'EVP_DecryptFinal_ex' failed` lines (19,330 in one case), followed by `nat_read_packet = -34001` and repeated `bud_thread = -28002`. It looks like the client still receives the previous session's packets and tries to decrypt each one with the new key. Those packets should be dropped quietly, and probably rate-limited in the log.
