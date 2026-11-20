@@ -30,14 +30,31 @@ What it does:
 
 Limitation: rumble isn't forwarded.
 
+## Workaround for frozen sessions (bug 3)
+
+`parsec-nat-follow` is a small root service. It watches Parsec's UDP socket, and when the host's packets switch to a new public port, it adds `nftables` NAT rules: outgoing packets go to the new port, and incoming packets look to Parsec like they still come from the old one. The flow gets a fresh conntrack zone each time, and the rules are removed when the session ends. It handles IPv4 only.
+
+```bash
+cd workaround
+sudo make install-nat-follow
+sudo systemctl daemon-reload
+sudo systemctl enable --now parsec-nat-follow
+journalctl -u parsec-nat-follow -f      # logs each port change it follows
+```
+
+`tools/nat_rebind_test.sh` simulates a rebinding between two network namespaces and needs no root (`unshare -rn tools/nat_rebind_test.sh`, or add `--without` for the baseline).
+
+The proper fix is in the client (follow authenticated packets from a new address), or on the host's network (a stable public port for the host).
+
 ## Layout
 
 | Path | Contents |
 |---|---|
 | `REPORT.md` | full bug report |
-| `workaround/` | launcher, pad proxy, preload shim, Makefile |
+| `workaround/` | launcher, pad proxy, preload shim, `parsec-nat-follow` + systemd unit, Makefile |
 | `upstream/libmatoya-evdev-drain.patch` | upstream fix for bug 2 |
 | `tools/matoya_sim.py` | simulation of libmatoya's input loop, with and without the fix |
+| `tools/nat_rebind_test.sh` | NAT rebinding simulation for `parsec-nat-follow` |
 
 ## License
 

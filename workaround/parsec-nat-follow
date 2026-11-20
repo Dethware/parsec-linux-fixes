@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""
+parsec-nat-follow: keep a Parsec P2P session alive when the host's NAT
+re-maps the host's public UDP port mid-session ("NAT rebinding").
+
+Parsec pins the peer's address:port for the whole session. When the host's
+NAT gives the flow a new external port, the host's packets start arriving
+from <host>:NEW, which the client ignores, while the client keeps sending to
+<host>:OLD, which no longer reaches the host -> frozen picture, then -12007.
+
+This helper watches Parsec's UDP socket. When the peer's packets switch from
+the port Parsec is using to a new port, it installs nftables NAT rules so
+that, from Parsec's point of view, nothing changed:
+
+    incoming  <host>:NEW -> <us>:L   is seen by Parsec as  <host>:OLD -> L
+    outgoing  <us>:L -> <host>:OLD   is sent on the wire as  -> <host>:NEW
+
+The flow is moved into a fresh conntrack zone for every mapping, so stale
+conntrack entries can never clash with the translated ones. Rules are
+removed when the session ends or Parsec moves to a different peer.
+
+Needs CAP_NET_ADMIN and CAP_NET_RAW (run as root / via the systemd unit).
+Only IPv4 is handled (Parsec's P2P traffic is IPv4-mapped).
+"""
+import argparse
+import ctypes
+import collections
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+TABLE = "parsec_nat_follow"
+ETH_P_ALL = 0x0003
+SO_ATTACH_FILTER = 26
+PACKET_OUTGOING = 4
+
+MIN_PPS = 20        # packets/s from the new port before we follow it
+PEER_MIN_PPS = 10   # packets/s Parsec must send to a peer to call it "the peer"
+
+
+def log(*a):
+    print("[parsec-nat-follow]", *a, file=sys.stderr, flush=True)
+
+
+def attach_ipv4_udp_filter(sock):
+    # Classic BPF on a SOCK_DGRAM packet socket (data starts at the IP
+    # header): accept IPv4 + UDP, truncated to 64 bytes; drop the rest.
+    prog = [
+        (0x30, 0, 0, 0x00000000),  # ldb [0]
+        (0x54, 0, 0, 0x000000F0),  # and #0xf0
+        (0x15, 0, 3, 0x00000040),  # jeq #0x40 ? next : drop
+        (0x30, 0, 0, 0x00000009),  # ldb [9]
+        (0x15, 0, 1, 0x00000011),  # jeq #17 ? accept : drop
+        (0x06, 0, 0, 0x00000040),  # ret #64
+        (0x06, 0, 0, 0x00000000),  # ret #0
+    ]
+    raw = b"".join(struct.pack("HBBI", *ins) for ins in prog)
+    buf = ctypes.create_string_buffer(raw)
+    fprog = struct.pack("HL", len(prog), ctypes.addressof(buf))
+    sock.setsockopt(socket.SOL_SOCKET, SO_ATTACH_FILTER, fprog)
+    return buf  # keep alive
+
+
+def parsec_ports(proc_name):
+    """Non-loopback UDP ports owned by proc_name (via ss -p)."""
+    try:
+        out = subprocess.run(["ss", "-Huanp"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    ports = set()
+    for line in out.splitlines():
+        if f'(("{proc_name}",' not in line:
+            continue
+        cols = line.split()
+        if len(cols) < 4:
+            continue
+        addr, _, port = cols[3].rpartition(":")
+        if addr.startswith("127.") or addr in ("[::1]", "[::ffff:127.0.0.1]"):
+            continue
+        try:
+            ports.add(int(port))
+        except ValueError:
+            pass
+    return ports
+
+
+class Nft:
+    def __init__(self, dry_run=False):
+        self.dry_run = dry_run
+        self.zone = 4100
+
+    def _run(self, script):
+        if self.dry_run:
+            log("nft (dry run):\n" + script)
+            return True
+        r = subprocess.run(["nft", "-f", "-"], input=script, text=True, capture_output=True)
+        if r.returncode != 0:
+            log("nft failed:", r.stderr.strip())
+            return False
+        return True
+
+    def apply(self, mappings):
+        """mappings: {local_port: (peer_ip, old_port, new_port)}"""
+        lines = [f"table inet {TABLE} {{}}", f"delete table inet {TABLE}"]
+        if not mappings:
+            return self._run("\n".join(lines) + "\n")
+        raw_pre, raw_out, nat_in, nat_out = [], [], [], []
+        for lport, (ip, old, new) in mappings.items():
+            self.zone = 4100 + (self.zone - 4100 + 1) % 60000
+            z = self.zone
+            raw_pre.append(f"ip saddr {ip} udp sport {new} udp dport {lport} ct zone set {z}")
+            raw_out.append(f"ip daddr {ip} udp sport {lport} udp dport {old} ct zone set {z}")
+            nat_in.append(f"ct zone {z} ip saddr {ip} udp sport {new} udp dport {lport} snat ip to {ip}:{old}")
+            nat_out.append(f"ct zone {z} ip daddr {ip} udp sport {lport} udp dport {old} dnat ip to {ip}:{new}")
+        body = [
+            f"table inet {TABLE} {{",
+            "  chain raw_pre { type filter hook prerouting priority raw; policy accept;",
+            *("    " + r for r in raw_pre), "  }",
+            "  chain raw_out { type filter hook output priority raw; policy accept;",
+            *("    " + r for r in raw_out), "  }",
+            "  chain nat_in { type nat hook input priority srcnat; policy accept;",
+            *("    " + r for r in nat_in), "  }",
+            "  chain nat_out { type nat hook output priority dstnat; policy accept;",
+            *("    " + r for r in nat_out), "  }",
+            "}",
+        ]
+        return self._run("\n".join(lines + body) + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--process", default="parsecd", help="process owning the UDP socket (default: parsecd)")
+    ap.add_argument("--local-port", type=int, action="append",
+                    help="watch this local UDP port instead of looking up the process (repeatable)")
+    ap.add_argument("--dry-run", action="store_true", help="log nft scripts instead of applying them")
+    args = ap.parse_args()
+
+    def on_term(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, on_term)
+
+    nft = Nft(args.dry_run)
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(ETH_P_ALL))
+    _keep = attach_ipv4_udp_filter(sock)
+    sock.settimeout(0.2)
+
+    peer = {}      # lport -> (ip, port as Parsec sees it)
+    mapping = {}   # lport -> (ip, old, new)
+    ports = set(args.local_port or [])
+    out_cnt = collections.Counter()   # (lport, ip, dport) per window
+    in_cnt = collections.Counter()    # (lport, ip, sport) per window
+    next_eval = time.monotonic() + 1.0
+    next_ports = 0.0
+
+    nft.apply({})  # clean slate
+    log("running; watching", f"ports {sorted(ports)}" if args.local_port else f"process {args.process!r}")
+
+    try:
+        while True:
+            now = time.monotonic()
+            if not args.local_port and now >= next_ports:
+                ports = parsec_ports(args.process)
+                next_ports = now + 2.0
+
+            try:
+                data, addr = sock.recvfrom(64)
+            except socket.timeout:
+                data = None
+            if data and len(data) >= 28:
+                ihl = (data[0] & 0x0F) * 4
+                if len(data) >= ihl + 4:
+                    sport, dport = struct.unpack("!HH", data[ihl:ihl + 4])
+                    src = socket.inet_ntoa(data[12:16])
+                    dst = socket.inet_ntoa(data[16:20])
+                    if addr[2] == PACKET_OUTGOING:
+                        if sport in ports:
+                            out_cnt[(sport, dst, dport)] += 1
+                    elif dport in ports:
+                        in_cnt[(dport, src, sport)] += 1
+
+            if now < next_eval:
+                continue
+            next_eval = now + 1.0
+            changed = False
+
+            for lport in list(mapping):
+                if lport not in ports:
+                    log(f"port {lport} gone, removing mapping {mapping[lport]}")
+                    del mapping[lport]
+                    peer.pop(lport, None)
+                    changed = True
+            for lport in list(peer):
+                if lport not in ports:
+                    del peer[lport]
+
+            for lport in ports:
+                outs = {(ip, dp): n for (lp, ip, dp), n in out_cnt.items() if lp == lport}
+                top = max(outs.items(), key=lambda kv: kv[1]) if outs else None
+
+                if lport in mapping:
+                    ip, old, new = mapping[lport]
+                    # on the wire, Parsec's packets to OLD show up as going to NEW
+                    if top and top[1] >= PEER_MIN_PPS and top[0] != (ip, new):
+                        log(f"port {lport}: Parsec now talks to {top[0]}, dropping mapping")
+                        del mapping[lport]
+                        peer[lport] = top[0]
+                        changed = True
+                elif top and top[1] >= PEER_MIN_PPS and peer.get(lport) != top[0]:
+                    peer[lport] = top[0]
+                    log(f"port {lport}: peer is {top[0][0]}:{top[0][1]}")
+
+                if lport not in peer:
+                    continue
+                ip, old = peer[lport]
+                current = mapping[lport][2] if lport in mapping else old
+                ins = {sp: n for (lp, sip, sp), n in in_cnt.items() if lp == lport and sip == ip}
+                if ins.get(current, 0) > 0:
+                    continue
+                cands = [(n, sp) for sp, n in ins.items() if sp != current]
+                if not cands:
+                    continue
+                n, sp = max(cands)
+                if n < MIN_PPS:
+                    continue
+                if sp == old:
+                    log(f"port {lport}: peer is back on {ip}:{old}, removing mapping")
+                    mapping.pop(lport, None)
+                else:
+                    log(f"port {lport}: peer {ip} moved {current} -> {sp} ({n} pkt/s); "
+                        f"mapping {ip}:{sp} <-> {ip}:{old}")
+                    mapping[lport] = (ip, old, sp)
+                changed = True
+
+            if changed:
+                nft.apply(mapping)
+            out_cnt.clear()
+            in_cnt.clear()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        nft.apply({})
+        log("stopped, rules removed")
+
+
+if __name__ == "__main__":
+    main()

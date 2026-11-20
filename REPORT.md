@@ -96,6 +96,8 @@ The other freeze that night (just before the capture started) ended after 43 s a
 
 **Suggested fix (client):** accept authenticated packets from a new source address/port and switch the send address to it (address roaming, as in WireGuard or QUIC connection migration). The packets are AES-GCM authenticated, so following a new address after a successful decrypt is safe.
 
+**Workaround on the client side:** `workaround/parsec-nat-follow` (a root service) notices the port change and adds `nftables` NAT rules, so Parsec keeps talking to the old port while the packets actually use the new one. In a simulation (`tools/nat_rebind_test.sh`) traffic resumes about a second after the switch.
+
 **Workaround on the host side:** give the host a stable public UDP mapping, e.g. a static port forward on the host's firewall to the host's Parsec ports (`host_start_port`), or a NAT policy that keeps the same external port for the lifetime of the flow.
 
 **Related:** after a disconnect followed by a reconnect within about a second, the client log fills with thousands of `MTY_AESGCMDecrypt: 'EVP_DecryptFinal_ex' failed` lines (19,330 in one case), followed by `nat_read_packet = -34001` and repeated `bud_thread = -28002`. It looks like the client still receives the previous session's packets and tries to decrypt each one with the new key. Those packets should be dropped quietly, and probably rate-limited in the log.
